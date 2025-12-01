@@ -3,7 +3,7 @@ from typing import Set, List
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda, RunnableParallel
 from langchain_core.documents import Document
-from langchain_ollama import OllamaLLM
+from langchain_ollama import OllamaLLM 
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -32,85 +32,92 @@ def format_docs(docs: List[Document]) -> str:
     return "\n\n".join(doc.page_content for doc in docs)
 
 def format_sources(docs: List[Document]) -> str:
-    """Extrae el nombre del archivo y la página de los metadatos para el usuario."""
+    """Extrae el nombre del archivo y número de página de los documentos recuperados."""
     sources = set()
     for doc in docs:
-        source = doc.metadata.get('source', 'N/A')
+        source = os.path.basename(doc.metadata.get('source', 'Desconocido'))
         page = doc.metadata.get('page', 'N/A')
-        theme = doc.metadata.get('theme', 'N/A')
-        file_name = os.path.basename(source) 
-        sources.add(f"[Tema: {theme}] Archivo: {file_name} (Página: {page})")
-    return "\n".join(sources)
+        sources.add(f"Archivo: {source}, Página: {page}")
+    
+    return "\n".join(sorted(list(sources)))
+
 
 # ----------------------------------------------------------------------
-# CREACIÓN DE LA CADENA RAG (LCEL CORREGIDO)
+# CREACIÓN DE LA CADENA RAG (Retrieval-Augmented Generation)
 # ----------------------------------------------------------------------
 
-def create_rag_chain(db: Chroma, llm_model_name: str, selected_theme: str):
+def create_rag_chain(db: Chroma, llm_model_name: str, theme_filter: str):
     """
-    Crea la cadena RAG (Retrieval Augmented Generation) usando LangChain Expression Language (LCEL).
-
-    Parámetros:
-        db (Chroma): La base de datos vectorial con los documentos.
-        llm_model_name (str): Nombre del modelo LLM a usar (ej: 'mistral').
-        selected_theme (str): El tema seleccionado para filtrar la búsqueda (o 'TODOS').
+    Crea la cadena RAG usando LCEL, asegurando que los documentos se recuperen
+    una sola vez y se pasen tanto para el contexto como para las fuentes.
     """
     
-    # 1. Inicializar el LLM
-    llm = OllamaLLM(model=llm_model_name)
-
+    # 1. Definir el modelo LLM usando OllamaLLM
+    try:
+        llm = OllamaLLM(model=llm_model_name)
+    except ImportError:
+        print(f"[ERROR CRÍTICO] Falta la dependencia 'langchain-ollama'. Asegúrate de que esté instalada.")
+        return None
+    except Exception as e:
+        print(f"[ERROR OLLAMA] No se pudo inicializar OllamaLLM con '{llm_model_name}'. Verifique su servicio Ollama. Error: {e}")
+        return None
+        
     # 2. Definir el Prompt
-    RAG_PROMPT = PromptTemplate.from_template("""Usa solo el siguiente contexto para responder a la pregunta. 
-Si la respuesta no está contenida en el contexto, simplemente di que no tienes suficiente información.
-El contexto proviene del tema: {theme}
-
-{context}
-
-Pregunta: {question}
-Respuesta Concisa:""")
-
-    # 3. Configurar el Filtro y el Retriever
-    # Inicializamos los argumentos de búsqueda solo con 'k'
-    search_kwargs = {"k": 5}
+    RAG_PROMPT = PromptTemplate.from_template("""
+        Eres un asistente de recuperación de información experto.
+        Utiliza SOLO los siguientes fragmentos de contexto para responder la pregunta del usuario.
+        Si la respuesta no se encuentra en el contexto proporcionado, indica claramente que la información no está disponible en los documentos.
+        
+        CONTEXTO:
+        ---
+        {context}
+        ---
+        
+        PREGUNTA: {question}
+        
+        Respuesta Detallada:
+    """)
     
-    if selected_theme and selected_theme.upper() != 'TODOS':
-        # Si se selecciona un tema específico, añadimos el filtro a los argumentos.
-        search_filter = {"theme": selected_theme}
-        search_kwargs["filter"] = search_filter # AÑADIMOS 'filter' SOLO SI NO ES 'TODOS'
+    # 3. Configurar el Retriever (siempre búsqueda simple 'similarity' para evitar el error de umbral)
+    search_kwargs = {'k': 5} # Recupera los 5 documentos más cercanos
+    
+    if theme_filter != "TODOS":
+        metadata_filter = {"theme": theme_filter}
+        search_kwargs['filter'] = metadata_filter
 
-    # Configurar el Retriever con los argumentos de búsqueda condicionales
     retriever = db.as_retriever(
+        search_type="similarity",
         search_kwargs=search_kwargs
     )
+    
+    # 4. Definición del pipeline LCEL
 
-    # 4. Pipeline para generar la Respuesta (Core): 
-    # Recibe {'documents': docs, 'question': q} y devuelve la respuesta del LLM.
-    rag_answer_generation = (
-        {
-            "context": RunnableLambda(lambda x: format_docs(x["documents"])), 
-            "question": RunnableLambda(lambda x: x["question"]),
-            "theme": RunnableLambda(lambda x: selected_theme) # Añadimos el tema al contexto del prompt
-        }
-        | RAG_PROMPT
-        | llm
+    # PASO A: Recuperar documentos Y mantener la pregunta
+    # Esto es una RunnableParallel que ejecuta el retriever y pasa la pregunta sin modificar.
+    # El resultado es un diccionario: {'docs': [Documentos...], 'question': '...'}.
+    retrieval_chain = RunnableParallel(
+        # 'docs' es una lista de Documentos. El retriever es Runnable.
+        docs=retriever, 
+        # 'question' es la cadena de texto de entrada que pasa sin cambios
+        question=RunnablePassthrough() 
     )
-    
-    # 5. Pipeline Final con Fuentes (LCEL CORREGIDO - Uso de RunnableParallel)
-    
-    # 5.1. Preparación de la cadena: Combina la pregunta con la recuperación de documentos.
-    rag_chain_prep = RunnableParallel(
-        documents=retriever,
-        question=RunnablePassthrough(),
-    )
-    
-    # 5.2. Cadena completa: Encadena la preparación con la ejecución paralela
-    # para obtener la 'answer' y las 'sources' al mismo tiempo.
-    rag_chain_with_sources = (
-        rag_chain_prep
-        | RunnableParallel(
-            answer=rag_answer_generation, 
-            sources=RunnableLambda(lambda x: format_sources(x["documents"]))
-        )
+
+    # PASO B: Generación de respuesta y extracción de fuentes
+    # Esto toma el diccionario {'docs': [docs], 'question': 'query'} del PASO A.
+    rag_chain_with_sources = retrieval_chain | RunnableParallel(
+        # 1. 'answer': Genera la respuesta
+        answer=(
+            RunnableParallel(
+                # Formatea los documentos para el contexto del prompt
+                context=RunnableLambda(lambda x: format_docs(x['docs'])), 
+                # Pasa la pregunta al prompt
+                question=RunnableLambda(lambda x: x['question'])
+            )
+            | RAG_PROMPT 
+            | llm
+        ),
+        # 2. 'sources': Extrae las fuentes usando los documentos ya recuperados
+        sources=RunnableLambda(lambda x: format_sources(x['docs']))
     )
     
     return rag_chain_with_sources
@@ -123,7 +130,15 @@ def create_summary_chain(llm_model_name: str):
     """
     Crea una cadena simple para resumir un texto dado.
     """
-    llm = OllamaLLM(model=llm_model_name)
+    # Usamos OllamaLLM para la cadena de resumen
+    try:
+        llm = OllamaLLM(model=llm_model_name)
+    except ImportError:
+        print(f"[ERROR CRÍTICO] Falta la dependencia 'langchain-ollama'. Asegúrate de que esté instalada.")
+        return None
+    except Exception as e:
+        print(f"[ERROR OLLAMA] No se pudo inicializar OllamaLLM para Summary. Verifique su servicio Ollama. Error: {e}")
+        return None
     
     SUMMARY_PROMPT = PromptTemplate.from_template("""
         Genera un resumen detallado y claro de UNO a DOS párrafos del siguiente texto.
@@ -137,10 +152,10 @@ def create_summary_chain(llm_model_name: str):
         Resumen:
     """)
     
-    # La cadena solo necesita el texto a resumir
     summary_chain = (
-        {"text": RunnablePassthrough()}
-        | SUMMARY_PROMPT
+        {"text": RunnablePassthrough()} 
+        | SUMMARY_PROMPT 
         | llm
     )
+    
     return summary_chain

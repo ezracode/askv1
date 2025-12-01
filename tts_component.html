@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="es">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -9,7 +9,8 @@
             display: flex;
             align-items: center;
             gap: 10px;
-            margin-top: 10px;
+            margin-top: 5px;
+            margin-bottom: 10px;
         }
         .tts-button {
             padding: 8px 15px;
@@ -26,29 +27,30 @@
             align-items: center;
             gap: 5px;
         }
-        .tts-button:hover {
+        .tts-button:hover:not(:disabled) {
             background-color: #2563EB; /* blue-600 */
             transform: translateY(-1px);
         }
-        .tts-button:active {
+        .tts-button:active:not(:disabled) {
             transform: translateY(0);
             box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
         }
         .tts-button:disabled {
             background-color: #9CA3AF; /* gray-400 */
             cursor: not-allowed;
-            box-shadow: none;
-        }
-        .icon {
-            font-size: 16px;
+            opacity: 0.8;
         }
         .loading-spinner {
-            border: 3px solid #f3f3f3;
-            border-top: 3px solid #ffffff;
+            border: 4px solid rgba(255, 255, 255, 0.3);
+            border-top: 4px solid #ffffff;
             border-radius: 50%;
             width: 14px;
             height: 14px;
             animation: spin 1s linear infinite;
+            display: none;
+        }
+        .tts-button.loading .loading-spinner {
+            display: block;
         }
         @keyframes spin {
             0% { transform: rotate(0deg); }
@@ -57,38 +59,90 @@
     </style>
 </head>
 <body>
-
-<div class="tts-container">
-    <button id="ttsButton__KEY__" class="tts-button" onclick="playAudio__KEY__()">
-        <span id="buttonIcon__KEY__" class="icon">🔊</span>
-        <span id="buttonText__KEY__">Leer Respuesta</span>
-    </button>
-</div>
+    <!-- El ID es fijo pero la KEY se usa para que Streamlit distinga los componentes -->
+    <div class="tts-container">
+        <button id="tts-button-__KEY__" class="tts-button" onclick="handleButtonClick()">
+            <span id="tts-icon-__KEY__">&#x23F5;</span> <!-- Icono de Play -->
+            <span id="tts-text-__KEY__">Reproducir Respuesta</span>
+            <div id="tts-spinner-__KEY__" class="loading-spinner"></div>
+        </button>
+        <span id="tts-status-__KEY__" style="font-size: 12px; color: #6B7280;"></span>
+    </div>
 
 <script>
-    // --- Configuración de la API (Reemplazada por Python) ---
-    const API_KEY_GLOBAL = ""; 
-    const TTS_MODEL_NAME = '__TTS_MODEL_NAME__'; // gemini-2.5-flash-preview-tts
-    const TTS_VOICE_NAME = '__TTS_VOICE_NAME__'; // Charon
-    const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL_NAME}:generateContent?key=${API_KEY_GLOBAL}`;
+    // --- VARIABLES DE INYECCIÓN DE PYTHON ---
+    // ESTAS VARIABLES SERÁN REEMPLAZADAS POR STREAMLIT/PYTHON
+    const TTS_MODEL_NAME = '__TTS_MODEL_NAME__'; // e.g., gemini-2.5-flash-preview-tts
+    const TTS_VOICE_NAME = '__TTS_VOICE_NAME__'; // e.g., Charon
+    const TEXT_TO_SPEAK = '__SAFE_TEXT__'; // Texto a convertir (JSON string)
+    const BUTTON_KEY = '__KEY__'; // Clave única para este componente
+    
+    // API KEY GLOBAL SE INYECTA AQUÍ
+    const API_KEY_GLOBAL = ""; // Se reemplaza por la clave real
 
-    // --- Contenido específico de esta instancia de botón (Reemplazado por Python) ---
-    const TEXT_TO_SPEAK = __SAFE_TEXT__;
-    const KEY = '__KEY__';
-
-    // --- Referencias del DOM ---
-    const button = document.getElementById(`ttsButton${KEY}`);
-    const iconSpan = document.getElementById(`buttonIcon${KEY}`);
-    const textSpan = document.getElementById(`buttonText${KEY}`);
-
-    // --- Almacenamiento de audio (para evitar regenerar) ---
+    // --- VARIABLES GLOBALES DE AUDIO ---
+    let audioContext = null;
     let audioBlob = null;
-    let audioContext = new (window.AudioContext || window.webkitAudioContext)();
     let audioSource = null;
 
+    // --- ELEMENTOS DOM ---
+    const button = document.getElementById(`tts-button-${BUTTON_KEY}`);
+    const statusSpan = document.getElementById(`tts-status-${BUTTON_KEY}`);
+    const buttonIcon = document.getElementById(`tts-icon-${BUTTON_KEY}`);
+    const buttonText = document.getElementById(`tts-text-${BUTTON_KEY}`);
+    const spinner = document.getElementById(`tts-spinner-${BUTTON_KEY}`);
+
+    // --- UTILIDADES ---
+
     /**
-     * Convierte la cadena base64 a un ArrayBuffer.
-     * @param {string} base64 - Datos de audio PCM codificados en base64.
+     * Convierte el audio PCM (raw data) a un Blob de WAV.
+     * La API Gemini TTS retorna PCM16 (L16), que necesita ser envuelto en un contenedor WAV.
+     * @param {Int16Array} pcmData - Datos de audio PCM sin procesar (Int16Array).
+     * @param {number} sampleRate - Tasa de muestreo (Ej: 16000).
+     * @returns {Blob} Un Blob que contiene el archivo WAV.
+     */
+    function pcmToWav(pcmData, sampleRate) {
+        const buffer = new ArrayBuffer(44 + pcmData.length * 2);
+        const view = new DataView(buffer);
+        let offset = 0;
+
+        // Escribir cadena de texto
+        function writeString(view, offset, str) {
+            for (let i = 0; i < str.length; i++) {
+                view.setUint8(offset + i, str.charCodeAt(i));
+            }
+        }
+
+        // Chunk 'RIFF'
+        writeString(view, offset, 'RIFF'); offset += 4;
+        view.setUint32(offset, 36 + pcmData.length * 2, true); offset += 4; // Longitud total
+        writeString(view, offset, 'WAVE'); offset += 4;
+
+        // Chunk 'fmt '
+        writeString(view, offset, 'fmt '); offset += 4;
+        view.setUint32(offset, 16, true); offset += 4; // Sub-chunk 1 size (16 for PCM)
+        view.setUint16(offset, 1, true); offset += 2; // Formato de audio (1 = PCM)
+        view.setUint16(offset, 1, true); offset += 2; // Número de canales (1)
+        view.setUint32(offset, sampleRate, true); offset += 4; // Frecuencia de muestreo
+        view.setUint32(offset, sampleRate * 2, true); offset += 4; // Byte rate (SampleRate * NumChannels * BitsPerSample/8)
+        view.setUint16(offset, 2, true); offset += 2; // Block align (NumChannels * BitsPerSample/8)
+        view.setUint16(offset, 16, true); offset += 2; // Bits por muestra (16)
+
+        // Chunk 'data'
+        writeString(view, offset, 'data'); offset += 4;
+        view.setUint32(offset, pcmData.length * 2, true); offset += 4; // Sub-chunk 2 size
+
+        // Escribir datos PCM (Int16)
+        for (let i = 0; i < pcmData.length; i++, offset += 2) {
+            view.setInt16(offset, pcmData[i], true);
+        }
+
+        return new Blob([view], { type: 'audio/wav' });
+    }
+
+    /**
+     * Convierte una cadena Base64 a un ArrayBuffer.
+     * @param {string} base64 - Cadena Base64 de datos PCM.
      * @returns {ArrayBuffer}
      */
     function base64ToArrayBuffer(base64) {
@@ -100,182 +154,181 @@
         }
         return bytes.buffer;
     }
+    
+    // --- ESTADO Y CONTROL ---
 
-    /**
-     * Convierte audio PCM a formato WAV.
-     * La API devuelve PCM de 16 bits firmado (L16).
-     * @param {Int16Array} pcm16 - Array de 16-bit PCM samples.
-     * @param {number} sampleRate - Tasa de muestreo (normalmente 24000).
-     * @returns {Blob} - Blob de audio WAV.
-     */
-    function pcmToWav(pcm16, sampleRate) {
-        const numChannels = 1;
-        const bytesPerSample = 2; // 16-bit PCM
+    function setButtonState(state, message = '') {
+        button.disabled = false;
+        button.classList.remove('loading', 'playing');
+        spinner.style.display = 'none';
 
-        const buffer = new ArrayBuffer(44 + pcm16.length * bytesPerSample);
-        const view = new DataView(buffer);
-
-        // RIFF chunk
-        writeString(view, 0, 'RIFF');
-        view.setUint32(4, 36 + pcm16.length * bytesPerSample, true);
-        writeString(view, 8, 'WAVE');
-
-        // fmt chunk
-        writeString(view, 12, 'fmt ');
-        view.setUint32(16, 16, true); // ChunkSize
-        view.setUint16(20, 1, true); // AudioFormat (1 for PCM)
-        view.setUint16(22, numChannels, true);
-        view.setUint32(24, sampleRate, true);
-        view.setUint32(28, sampleRate * numChannels * bytesPerSample, true); // ByteRate
-        view.setUint16(32, numChannels * bytesPerSample, true); // BlockAlign
-        view.setUint16(34, 16, true); // BitsPerSample
-
-        // data chunk
-        writeString(view, 36, 'data');
-        view.setUint32(40, pcm16.length * bytesPerSample, true); // DataSize
-
-        // Escribir los datos PCM
-        let offset = 44;
-        for (let i = 0; i < pcm16.length; i++, offset += 2) {
-            view.setInt16(offset, pcm16[i], true);
-        }
-
-        return new Blob([buffer], { type: 'audio/wav' });
-
-        function writeString(view, offset, string) {
-            for (let i = 0; i < string.length; i++) {
-                view.setUint8(offset + i, string.charCodeAt(i));
-            }
-        }
-    }
-
-    /**
-     * Maneja el cambio de estado del botón TTS.
-     * @param {string} state - 'idle', 'loading', 'playing'
-     */
-    function setButtonState(state) {
         if (state === 'loading') {
             button.disabled = true;
-            iconSpan.innerHTML = '<div class="loading-spinner"></div>';
-            textSpan.textContent = 'Generando Voz...';
+            button.classList.add('loading');
+            buttonText.textContent = 'Generando Audio...';
+            buttonIcon.innerHTML = '';
+            spinner.style.display = 'block';
+            statusSpan.textContent = message;
         } else if (state === 'playing') {
-            button.disabled = false;
-            iconSpan.textContent = '⏸️';
-            textSpan.textContent = 'Pausar';
-        } else { // idle
-            button.disabled = false;
-            iconSpan.textContent = '🔊';
-            textSpan.textContent = 'Leer Respuesta';
+            button.classList.add('playing');
+            buttonText.textContent = 'Detener';
+            buttonIcon.innerHTML = '&#x23F9;'; // Icono de Stop
+            statusSpan.textContent = message;
+        } else if (state === 'idle') {
+            buttonText.textContent = 'Reproducir Respuesta';
+            buttonIcon.innerHTML = '&#x23F5;'; // Icono de Play
+            statusSpan.textContent = message;
+        } else if (state === 'error') {
+             buttonText.textContent = 'Error';
+             buttonIcon.innerHTML = '&#x274C;'; // Icono de X
+             statusSpan.textContent = message;
         }
     }
 
-    /**
-     * Detiene la reproducción de audio si está activa.
-     */
     function stopAudio() {
         if (audioSource) {
             audioSource.stop();
             audioSource = null;
+            setButtonState('idle');
         }
     }
-    
+
     /**
-     * Función principal que se llama al hacer clic en el botón.
+     * Lógica principal del botón: Inicia la generación si el audio no existe, o reproduce/detiene si ya existe.
      */
-    async function playAudio__KEY__() {
-        if (audioSource) {
-            // Caso 1: Está reproduciendo -> Pausar/Detener
+    async function handleButtonClick() {
+        if (!API_KEY_GLOBAL) {
+            setButtonState('error', 'API Key no disponible para TTS.');
+            return;
+        }
+        
+        // Si ya hay audio reproduciéndose, detenerlo.
+        if (audioSource && audioContext.state === 'running') {
             stopAudio();
-            setButtonState('idle');
             return;
         }
 
+        // Inicializar AudioContext si no existe
+        if (!audioContext) {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        
+        // Reanudar si está suspendido (necesario por las políticas de navegadores)
+        if (audioContext.state === 'suspended') {
+            await audioContext.resume();
+        }
+
+        // Si el audio ya fue generado, reproducir directamente
         if (audioBlob) {
-            // Caso 2: Audio ya generado -> Reproducir
             await startPlayback();
             return;
         }
         
-        // Caso 3: Audio no generado -> Generar y reproducir
-        if (!API_KEY_GLOBAL) {
-            alert("Error: La clave API de Google no está configurada. El TTS no puede funcionar.");
+        // Si no hay Blob, iniciar la generación
+        await generateTTS();
+    }
+
+    /**
+     * Llama al API de Gemini para generar el audio PCM.
+     */
+    async function generateTTS() {
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${TTS_MODEL_NAME}:generateContent?key=${API_KEY_GLOBAL}`;
+        
+        let text;
+        try {
+            // Deserializa el JSON inyectado
+            text = JSON.parse(TEXT_TO_SPEAK);
+        } catch (e) {
+            console.error("Error al parsear el texto inyectado:", e);
+            setButtonState('error', 'Error en el texto de entrada.');
+            return;
+        }
+        
+        const payload = {
+            contents: [{
+                parts: [{ text: `Di con tono neutro y claro: ${text}` }] // Añade instrucción para mejor calidad
+            }],
+            generationConfig: {
+                responseModalities: ["AUDIO"],
+                speechConfig: {
+                    voiceConfig: {
+                        prebuiltVoiceConfig: { voiceName: TTS_VOICE_NAME }
+                    }
+                }
+            },
+            model: TTS_MODEL_NAME
+        };
+
+        setButtonState('loading', 'Llamando al API...');
+        
+        // Implementación de backoff exponencial
+        const maxRetries = 5;
+        let attempt = 0;
+        let response = null;
+
+        while (attempt < maxRetries) {
+            try {
+                response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (response.ok) {
+                    break; 
+                } else if (response.status === 429 && attempt < maxRetries - 1) {
+                    const delay = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
+                    console.log(`[TTS] Límite de tasa alcanzado. Reintentando en ${delay.toFixed(0)}ms...`);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                } else {
+                    const errorJson = await response.json();
+                    throw new Error(`Error HTTP ${response.status}: ${JSON.stringify(errorJson)}`);
+                }
+            } catch (error) {
+                if (attempt === maxRetries - 1) {
+                    throw error; // Lanzar el error final
+                }
+            }
+            attempt++;
+        }
+        
+        if (!response || !response.ok) {
+            setButtonState('error', 'Fallo de conexión o del servidor.');
             return;
         }
 
-        setButtonState('loading');
-        
         try {
-            const payload = {
-                contents: [{
-                    parts: [{ text: `Say in a smooth, informative tone: ${TEXT_TO_SPEAK}` }]
-                }],
-                generationConfig: {
-                    responseModalities: ["AUDIO"],
-                    speechConfig: {
-                        voiceConfig: {
-                            prebuiltVoiceConfig: { voiceName: TTS_VOICE_NAME }
-                        }
-                    }
-                },
-                model: TTS_MODEL_NAME
-            };
-
-            // Implementación de Backoff Exponencial
-            let response = null;
-            let maxRetries = 5;
-            let delay = 1000;
-            
-            for (let i = 0; i < maxRetries; i++) {
-                try {
-                    response = await fetch(API_URL, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-
-                    if (response.status !== 429) { // No es un error de Rate Limit
-                        break; 
-                    }
-                } catch (error) {
-                    console.error(`Fetch error (retry ${i + 1}):`, error);
-                }
-
-                if (i < maxRetries - 1) {
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                    delay *= 2;
-                } else {
-                    throw new Error("Máximo de reintentos alcanzado.");
-                }
-            }
-            
-            if (!response || !response.ok) {
-                const errorBody = await response.json();
-                throw new Error(`API call failed with status ${response.status}: ${JSON.stringify(errorBody)}`);
-            }
-
             const result = await response.json();
             const part = result?.candidates?.[0]?.content?.parts?.[0];
             const audioData = part?.inlineData?.data;
             const mimeType = part?.inlineData?.mimeType;
 
             if (audioData && mimeType && mimeType.startsWith("audio/L16")) {
-                // La API devuelve audio/L16;rate=24000
-                const sampleRateMatch = mimeType.match(/rate=(\d+)/);
-                const sampleRate = sampleRateMatch ? parseInt(sampleRateMatch[1], 10) : 24000;
                 
-                const pcmData = base64ToArrayBuffer(audioData);
-                const pcm16 = new Int16Array(pcmData);
-                
-                audioBlob = pcmToWav(pcm16, sampleRate);
-                await startPlayback();
-            } else {
-                throw new Error("Respuesta de audio inválida o datos de audio faltantes.");
-            }
+                // Extraer Sample Rate (esperamos 16000 o similar, pero lo extraemos del mimeType si es posible)
+                // Formato esperado: audio/L16;rate=16000
+                const rateMatch = mimeType.match(/rate=(\d+)/);
+                const sampleRate = rateMatch ? parseInt(rateMatch[1], 10) : 16000; 
 
+                const pcmBuffer = base64ToArrayBuffer(audioData);
+                // La API retorna PCM16 (signed 16-bit)
+                const pcm16 = new Int16Array(pcmBuffer); 
+                
+                // Convertir a WAV Blob
+                audioBlob = pcmToWav(pcm16, sampleRate);
+                
+                setButtonState('idle', 'Audio listo para reproducir.');
+                // Iniciar la reproducción automáticamente después de generar
+                await startPlayback();
+
+            } else {
+                const errorMessage = part?.text || 'Respuesta de audio inválida o incompleta.';
+                setButtonState('error', errorMessage);
+                console.error("TTS API Response Error:", result);
+            }
         } catch (error) {
-            console.error("Error al generar o reproducir TTS:", error);
-            setButtonState('idle');
-            alert(`Error TTS: ${error.message}.`);
+            console.error("Error al procesar la respuesta TTS:", error);
+            setButtonState('error', `Error de procesamiento: ${error.message}`);
         }
     }
 
@@ -283,9 +336,9 @@
      * Inicia la reproducción del Blob de audio ya generado.
      */
     async function startPlayback() {
-        if (!audioBlob) return;
+        if (!audioBlob || !audioContext) return;
         
-        setButtonState('playing');
+        setButtonState('playing', 'Reproduciendo...');
         
         try {
             // Crea un ArrayBuffer desde el Blob
@@ -299,25 +352,26 @@
             audioSource = audioContext.createBufferSource();
             audioSource.buffer = audioBuffer;
             audioSource.connect(audioContext.destination);
-            audioSource.start(0);
-
-            // Manejar el evento de finalización de la reproducción
+            
+            // Definir el evento onended ANTES de llamar a start()
             audioSource.onended = () => {
                 if (audioSource) {
-                    setButtonState('idle');
+                    setButtonState('idle', 'Reproducción finalizada.');
                     audioSource = null;
                 }
             };
+
+            audioSource.start(0);
+
         } catch (error) {
             console.error("Error al iniciar la reproducción:", error);
-            setButtonState('idle');
-            alert(`Error de reproducción: ${error.message}`);
+            setButtonState('error', `Error de reproducción: ${error.message}`);
         }
     }
 
     // Inicializar el estado del botón al cargar
     document.addEventListener('DOMContentLoaded', () => {
-        setButtonState('idle');
+        setButtonState('idle', 'Listo');
     });
 
 </script>

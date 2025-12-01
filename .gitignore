@@ -1,5 +1,6 @@
 __pycache__
-chroma_db_rag
+chroma_db_rag*
+db_chunking*
 env
 libros
 processed_files.txt
