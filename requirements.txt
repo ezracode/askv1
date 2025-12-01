@@ -1,0 +1,11 @@
+langchain
+langchain-core
+langchain-community
+langchain-google-genai
+langchain-chroma
+langchain-text-splitters
+langchain-ollama
+langchain-huggingface
+sentence-transformers
+streamlit
+pypdf
