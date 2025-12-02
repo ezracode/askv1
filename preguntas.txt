@@ -1,0 +1,5 @@
+Cuál es el uso más común que se le da a la técnica Pose Estimation?
+En que casos es útil la programación dinámica?
+Puedes explicar que es el background replacement y cuál técnica se usa para esta tarea?
+Que es la reconstrucción de superficies?
+Puedes explicar el concepto de SLAM?

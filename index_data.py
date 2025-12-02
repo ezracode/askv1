@@ -1,228 +1,159 @@
 import os
-import shutil
 from typing import Set, Tuple, List
 from datetime import datetime
 import gc 
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter, CharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader 
+from langchain_text_splitters import RecursiveCharacterTextSplitter, CharacterTextSplitter 
+from langchain_huggingface import HuggingFaceEmbeddings 
 from langchain_chroma import Chroma 
 from langchain_core.documents import Document
 
-# Importar initialize_embeddings y constantes necesarias de rag_utils
-from rag_utils import initialize_embeddings, EMBED_MODEL_NAME
-
-# --- CONFIGURACIÓN ---
+# --- CONFIGURACIÓN DE RUTAS Y MODELOS ---
 DATA_PATH = "./libros/"
 PROCESSED_LOG = "./processed_files.txt"
-# Nueva ruta base clara para el experimento de chunking
-CHROMA_BASE_PATH = "./db_chunking" 
+EMBED_MODEL_NAME = "paraphrase-multilingual-mpnet-base-v2" 
 
-# Definición de las tres estrategias de chunking basadas en TIPO DE SPLITTER
-CHUNK_STRATEGIES = {
-    # La estrategia de uso general se renombró para usar un sufijo claro
-    "Recursive (Recomendada)": {
-        "db_suffix": "_recursive", 
-        "splitter_type": "recursive",
-        "chunk_size": 1500,
-        "chunk_overlap": 300,
-        "desc": "RecursiveCharacterTextSplitter. Usa separadores jerárquicos (\\n\\n, \\n, espacio) para mantener la coherencia lógica. Es la más robusta."
-    },
-    "Fixed Size (Simple)": {
-        "db_suffix": "_fixed",
-        "splitter_type": "character",
-        "chunk_size": 1500,
-        "chunk_overlap": 300,
-        "desc": "CharacterTextSplitter. Divide estrictamente por tamaño de carácter. Ignora la estructura lógica, lo que puede causar fragmentos incoherentes."
-    },
-    "Structural (Avanzada)": {
-        "db_suffix": "_structural",
-        "splitter_type": "structural",
-        "chunk_size": 1500,
-        "chunk_overlap": 300,
-        "desc": "Simulación Estructural (basada en Recursive). Prioriza separadores largos como títulos y encabezados (\\n\\n\\n, \\n\\n) para dividir por secciones claras, ideal para documentos con estructura fuerte."
-    },
-}
+# Rutas de bases de datos Chroma (¡CRÍTICO: Deben ser consistentes!)
+CHROMA_DB_PATH_RECURSIVE = "./chroma_db_rag_recursive"
+CHROMA_DB_PATH_FIXED = "./chroma_db_rag_fija"
+CHROMA_DB_PATH_STRUCTURED = "./chroma_db_rag_estructurada" 
 
-def get_db_path_for_strategy(strategy_name: str) -> str:
-    """
-    Genera la ruta única de la DB para una estrategia dada.
-    Todas las rutas son únicas y no usan la ruta base original ./chroma_db_rag.
-    """
-    config = CHUNK_STRATEGIES.get(strategy_name, {})
-    suffix = config.get("db_suffix", "_default")
-    
-    # La ruta de la DB será CHROMA_BASE_PATH + sufijo, e.g., './db_chunking_recursive'
-    return f"{CHROMA_BASE_PATH}{suffix}"
+# Configuración de chunking
+CHUNK_SIZE_REC = 1500
+CHUNK_OVERLAP_REC = 300
+CHUNK_SIZE_FIXED_STRUCT = 1000 
+CHUNK_OVERLAP_FIXED_STRUCT = 200
 
-def get_splitter_instance(strategy_config: dict):
-    """Inicializa y retorna la instancia del splitter de texto según la estrategia."""
-    
-    size = strategy_config['chunk_size']
-    overlap = strategy_config['chunk_overlap']
-    splitter_type = strategy_config['splitter_type']
-    
-    if splitter_type == "recursive":
-        return RecursiveCharacterTextSplitter(
-            chunk_size=size, 
-            chunk_overlap=overlap, 
-            separators=["\n\n", "\n", " ", ""] # Jerarquía por defecto
-        )
-    
-    elif splitter_type == "character":
-        # Divide rígidamente por tamaño de carácter.
-        # CORRECCIÓN: Se eliminó el parámetro 'chunk_size_size'
-        return CharacterTextSplitter(
-            chunk_size=size, 
-            chunk_overlap=overlap, 
-            separator="\n\n", # Usar doble salto de línea como separador por defecto
-        )
-        
-    elif splitter_type == "structural":
-        # Simula una división estructural priorizando grandes separadores
-        return RecursiveCharacterTextSplitter(
-            chunk_size=size, 
-            chunk_overlap=overlap, 
-            separators=[
-                "\n\n\n", # Triple salto de línea 
-                "\n\n",   # Doble salto de línea (párrafo nuevo)
-                "\n",     # Salto de línea simple
-                " ",      # Espacio
-                ""        # Caracter
-            ]
-        )
-    
-    return RecursiveCharacterTextSplitter(chunk_size=size, chunk_overlap=overlap) # Fallback
+def initialize_embeddings():
+    """Inicializa y retorna el modelo de embeddings."""
+    try:
+        return HuggingFaceEmbeddings(model_name=EMBED_MODEL_NAME)
+    except Exception as e:
+        print(f"[CRITICAL ERROR] Failed to load embeddings model: {e}")
+        raise
 
-# ----------------------------------------------------------------------
-# LÓGICA DE CARGA DE DOCUMENTOS
-# ----------------------------------------------------------------------
+def _get_processed_files(log_path: str) -> Set[str]:
+    """Lee el log y extrae solo las rutas de los archivos."""
+    processed_files = set()
+    try:
+        with open(log_path, 'r', encoding='utf-8') as f:
+            for line in f: 
+                line = line.strip()
+                if line and not line.startswith("---") and not line.startswith("DURACIÓN") and line.endswith('.pdf'):
+                    processed_files.add(line.replace('\\', '/').replace('./', '')) 
+    except FileNotFoundError:
+        pass
+    return processed_files
 
-def _get_files_to_process() -> List[str]:
-    """Encuentra todos los archivos PDF en DATA_PATH."""
-    all_files = []
-    for root, _, files in os.walk(DATA_PATH):
+def _load_new_documents(data_path: str, processed_files: Set[str]) -> Tuple[List[Document], List[str]]:
+    """Carga documentos nuevos que no están en el log."""
+    new_documents = []
+    newly_processed_paths = []
+    
+    for root, _, files in os.walk(data_path):
         for file in files:
-            if file.lower().endswith('.pdf'):
-                full_path = os.path.join(root, file)
-                all_files.append(os.path.abspath(full_path))
-    return all_files
+            if file.endswith(".pdf"):
+                file_path = os.path.join(root, file)
+                log_path = os.path.relpath(file_path, start='./').replace('\\', '/')
+                
+                relative_dir = os.path.relpath(root, data_path)
+                theme_name = relative_dir if relative_dir != '.' else "UNTITLED"
+                
+                if log_path not in processed_files:
+                    try:
+                        loader = PyPDFLoader(file_path)
+                        docs = loader.load()
+                        
+                        for doc in docs:
+                            doc.metadata['theme'] = theme_name
+                            
+                        new_documents.extend(docs)
+                        newly_processed_paths.append(log_path) 
+                        print(f"   [Cargando] {file} (Tema: {theme_name})")
+                        
+                    except Exception as e:
+                        print(f"   [ERROR] No se pudo cargar {file}: {e}")
+                else:
+                    print(f"   [Omitiendo] {file} (Ya procesado)")
+    
+    return new_documents, newly_processed_paths
 
-def _load_and_tag_documents(file_paths: List[str]) -> List[Document]:
-    """Carga los documentos PDF y añade metadatos de 'source' y 'theme'."""
-    all_docs = []
-    for file_path in file_paths:
+def load_and_index_data(chroma_db_path: str, embeddings: HuggingFaceEmbeddings, new_documents: List[Document], strategy: str):
+    """Divide, vectoriza e indexa los documentos en la base de datos Chroma especificada."""
+    if not new_documents:
+        print(f"   -> No hay documentos nuevos para indexar en {chroma_db_path}.")
+        return 0
+        
+    print(f"   -> Indexando {len(new_documents)} documentos en {chroma_db_path} con estrategia '{strategy}'...")
+
+    if strategy == "recursive":
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE_REC, chunk_overlap=CHUNK_OVERLAP_REC)
+    elif strategy == "fixed": 
+        text_splitter = CharacterTextSplitter(chunk_size=CHUNK_SIZE_FIXED_STRUCT, chunk_overlap=CHUNK_OVERLAP_FIXED_STRUCT)
+    elif strategy == "structured":
+        text_splitter = CharacterTextSplitter(chunk_size=CHUNK_SIZE_FIXED_STRUCT, chunk_overlap=CHUNK_OVERLAP_FIXED_STRUCT, separator="\n\n")
+    else:
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE_REC, chunk_overlap=CHUNK_OVERLAP_REC)
+
+    chunks = text_splitter.split_documents(new_documents)
+    
+    db = Chroma(persist_directory=chroma_db_path, embedding_function=embeddings)
+    db.add_documents(chunks) 
+    
+    print(f"   [Éxito] {len(chunks)} chunks vectorizados y guardados en {chroma_db_path}.")
+    
+    del db
+    gc.collect() 
+    return len(chunks)
+
+def run_indexing():
+    """Función principal para coordinar la carga y las tres indexaciones."""
+    start_time = datetime.now()
+    print(f"--- FASE 1: CARGANDO DOCUMENTOS ---")
+    
+    processed_files = _get_processed_files(PROCESSED_LOG)
+    new_documents, newly_processed_paths = _load_new_documents(DATA_PATH, processed_files)
+
+    if newly_processed_paths:
+        print(f"\nSe encontraron {len(newly_processed_paths)} archivos nuevos (Total de páginas: {len(new_documents)}).")
+        
         try:
-            relative_path = os.path.relpath(os.path.dirname(file_path), DATA_PATH)
-            theme = relative_path if relative_path != '.' else "Sin Tema" 
-            loader = PyPDFLoader(file_path)
-            docs = loader.load()
-            
-            for doc in docs:
-                doc.metadata["theme"] = theme
-                doc.metadata["source"] = file_path
-                if 'page' in doc.metadata and isinstance(doc.metadata.get('page'), int):
-                    # Se añade +1 para que la página mostrada al usuario sea 1-indexed (más intuitiva)
-                    doc.metadata['page'] = doc.metadata['page'] + 1 
-                all_docs.append(doc)
-            
+            embeddings = initialize_embeddings()
         except Exception as e:
-            print(f"[ERROR DE CARGA] No se pudo cargar o procesar {os.path.basename(file_path)}. Error: {e}")
-    return all_docs
+            print(f"\n[ERROR] No se pudo inicializar los Embeddings. Abortando indexación: {e}")
+            return 
 
-# ----------------------------------------------------------------------
-# FUNCIÓN DE INDEXACIÓN PRINCIPAL (Ajustada para Múltiples DBs)
-# ----------------------------------------------------------------------
+        # Indexación en las tres bases de datos
+        load_and_index_data(CHROMA_DB_PATH_RECURSIVE, embeddings, new_documents, "recursive")
+        load_and_index_data(CHROMA_DB_PATH_FIXED, embeddings, new_documents, "fixed")
+        load_and_index_data(CHROMA_DB_PATH_STRUCTURED, embeddings, new_documents, "structured")
+        
+        # Actualizar el LOG
+        duration = datetime.now() - start_time
+        log_content = [
+            f"\n\n--- REGISTRO DE INDEXACIÓN ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')}) ---",
+            f"DURACIÓN TOTAL (Función): {duration.total_seconds():.2f} segundos",
+            f"ARCHIVOS PROCESADOS ({len(newly_processed_paths)} nuevos):"
+        ]
+        log_content.extend(newly_processed_paths)
+        log_content.append("----------------------------------------------------------------------")
 
-def load_and_index_all_strategies(embeddings):
-    """
-    Ejecuta el pipeline de indexación para cada estrategia de chunking.
-    Solo indexa si la DB no existe o está vacía.
-    """
-        
-    all_files_to_load = _get_files_to_process()
-    
-    if not all_files_to_load:
-        print("No se encontraron archivos PDF en el directorio './libros/'. Indexación cancelada.")
-        return
-
-    print(f"Cargando y etiquetando documentos ({len(all_files_to_load)} archivos)...")
-    all_docs = _load_and_tag_documents(all_files_to_load)
-    
-    if not all_docs:
-        print("No se pudieron cargar documentos. Revisa si los PDFs están corruptos.")
-        return
-
-    print(f"Total de páginas cargadas para segmentación: {len(all_docs)}")
-    print("----------------------------------------------------------------------")
-    
-    files_processed_for_log = False
-    
-    # Itera sobre cada estrategia
-    for strategy_name, config in CHUNK_STRATEGIES.items():
-        start_time = datetime.now()
-        db_path = get_db_path_for_strategy(strategy_name)
-        
-        # 1. Verificar si la DB ya existe para esta estrategia
-        if os.path.exists(db_path) and os.listdir(db_path):
-            print(f"[{strategy_name}] DB ya existe en {db_path}. Saltando indexación.")
-            files_processed_for_log = True 
-            continue
-            
-        print(f"[{strategy_name}] --- INICIANDO INDEXACIÓN ---")
-        print(f"   Tipo de Splitter: {config['splitter_type'].upper()}")
-        print(f"   Ruta de DB: {db_path}")
-        
-        # 2. Aplicar Estrategia de Chunking
-        splitter = get_splitter_instance(config)
-        chunks = splitter.split_documents(all_docs)
-        print(f"   Documentos segmentados en {len(chunks)} fragmentos (chunks).")
-        
-        # 3. Crear Base de Datos
         try:
-            db = Chroma.from_documents(
-                documents=chunks,
-                embedding=embeddings,
-                persist_directory=db_path
-            )
-            
-            duration = datetime.now() - start_time
-            print(f"   ✅ Indexación completada. DB guardada en: {db_path}")
-            print(f"   Duración: {duration.total_seconds():.2f} segundos.")
-            files_processed_for_log = True
-        except Exception as e:
-            print(f"   [ERROR CRÍTICO] Falló la indexación para {strategy_name}: {e}")
-            
-    # 4. Actualizar Log de Procesados
-    if files_processed_for_log:
-        print("\n--- ACTUALIZANDO LOG DE ARCHIVOS PROCESADOS ---")
-        log_content = [f"{f} - {datetime.now().isoformat()}" for f in all_files_to_load]
-        
-        try:
-            # Aquí sobrescribimos el log para reflejar que al menos una estrategia se completó con estos archivos
-            with open(PROCESSED_LOG, 'w', encoding='utf-8') as f:
+            with open(PROCESSED_LOG, 'a', encoding='utf-8') as f:
                 f.write('\n'.join(log_content))
-            print(f"Registro actualizado en: {PROCESSED_LOG}")
+            print(f"\nRegistro actualizado en: {PROCESSED_LOG}")
         except Exception as e:
             print(f"[ERROR DE ESCRITURA] No se pudo escribir en {PROCESSED_LOG}: {e}")
     else:
-        print("\nTodas las bases de datos ya estaban al día o no hay archivos para procesar. Log no actualizado.")
+        print("No se detectaron archivos nuevos para indexar. El sistema está actualizado.")
+        print(f"DURACIÓN TOTAL (Chequeo): {(datetime.now() - start_time).total_seconds():.2f} segundos")
 
-# --- Punto de entrada para ejecución standalone ---
+
 if __name__ == "__main__":
-    print("--- INICIANDO SCRIPT DE INDEXACIÓN MÚLTIPLE (COMPARACIÓN DE SPLITTERS) ---")
-    
+    print("--- INICIANDO SCRIPT DE INDEXACIÓN ---\n")
     try:
-        # Nota: La función initialize_embeddings está en rag_utils
-        embeddings = initialize_embeddings()
-    except Exception:
-        print("\nINDEXACIÓN FALLIDA. Revisa el error anterior.")
-        exit(1)
-
-    try:
-        load_and_index_all_strategies(embeddings)
-        print("\n--- PROCESO DE INDEXACIÓN MÚLTIPLE COMPLETO. ---")
-        print(f"Bases de datos disponibles para el experimento de chunking en las carpetas que inician con: {CHROMA_BASE_PATH}_*")
+        run_indexing() 
+        print("\n--- INDEXACIÓN COMPLETA Y PERSISTIDA. ---")
     except Exception as e:
-        # Esto atrapará errores generales, pero el error de parámetro ya fue corregido en get_splitter_instance
-        print(f"\n[ERROR CRÍTICO] La indexación falló en la etapa final: {e}")
+        print(f"\nINDEXACIÓN FALLIDA. Revisa el error: {e}")
         exit(1)

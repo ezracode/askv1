@@ -1,358 +1,276 @@
 import streamlit as st
 import os
 import json
-import shutil
-from typing import Set, Tuple
+from typing import Set, List, Optional
+from datetime import datetime
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-# Importamos la clase OllamaLLM actualizada a través de rag_utils
-from rag_utils import initialize_embeddings, create_rag_chain, create_summary_chain
-# Importaciones de constantes de ruta y estrategias desde index_data
-# Usamos try/except para asegurar que las constantes estén disponibles
-try:
-    # Intenta importar del archivo index_data.py
-    from index_data import CHUNK_STRATEGIES, PROCESSED_LOG, EMBED_MODEL_NAME, get_db_path_for_strategy, DATA_PATH
-except ImportError:
-    # Si index_data.py no existe o no se puede importar, usamos valores por defecto (ESTO DEBE SER EVITADO)
-    CHUNK_STRATEGIES = {"Recursive (Recomendada)": {"desc": "Default strategy"}}
-    PROCESSED_LOG = "./processed_files.txt"
-    EMBED_MODEL_NAME = "paraphrase-multilingual-mpnet-base-v2"
-    DATA_PATH = "./libros/"
-    def get_db_path_for_strategy(strategy): return f"./chroma_db_rag_{strategy.split(' ')[0].lower()}"
+from langchain_core.prompts import PromptTemplate 
+# Importamos las herramientas de LCEL
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda 
+from langchain_core.output_parsers import StrOutputParser
+from langchain_ollama import OllamaLLM 
 
+# Importaciones de constantes de ruta desde el script de indexación
+from index_data import (
+    DATA_PATH, 
+    EMBED_MODEL_NAME, 
+    CHROMA_DB_PATH_RECURSIVE, 
+    CHROMA_DB_PATH_FIXED, 
+    CHROMA_DB_PATH_STRUCTURED,
+    initialize_embeddings
+)
 
-from rag_utils import LLM_MODEL_NAME
-
-# --- CONFIGURACIÓN DE LA APP ---
+# --- CONFIGURACIÓN CENTRAL ---
 TTS_MODEL_NAME = "gemini-2.5-flash-preview-tts"
 TTS_VOICE_NAME = "Charon" 
 TTS_TEMPLATE_FILE = "tts_component.html" 
+# LLM Local de Ollama
 LLM_MODEL_NAME = "mistral" 
-
-# --- OBTENER API KEY GLOBAL DE CANVAS ---
+PROCESSED_LOG = "./processed_files.txt"
 API_KEY_GLOBAL = os.environ.get('__api_key', '')
 
-# --- FUNCIONES DE LOG Y TEMA ---
+# --- UTILIDADES DE CHAIN DE LANCHAIN ---
 
-def _get_processed_themes() -> Set[str]:
-    """
-    Lee la estructura de carpetas dentro de DATA_PATH para determinar los temas procesados.
-    """
-    all_themes = {"TODOS"}
-    
-    # Buscamos todas las subcarpetas dentro de DATA_PATH
-    if os.path.exists(DATA_PATH):
-        for item in os.listdir(DATA_PATH):
-            full_path = os.path.join(DATA_PATH, item)
-            # Si es un directorio y no está oculto (como .DS_Store), lo consideramos un tema
-            if os.path.isdir(full_path) and not item.startswith('.'):
-                all_themes.add(item)
-    
-    return all_themes
+# Función auxiliar para formatear el contexto (Documentos) y agregar fuentes
+def format_docs(docs):
+    text_content = "\n\n---\n\n".join([doc.page_content for doc in docs])
+    return text_content
 
-# --- FUNCIÓN DE CARGA DEL HTML (CACHEADA) ---
+def create_rag_chain(llm_model_name: str, db: Chroma, metadata_filter: dict):
+    """Crea y retorna la cadena RAG con filtro de metadatos."""
+    
+    # 1. Configuración del Retriever con filtro de metadatos
+    retriever = db.as_retriever(
+        search_kwargs={"filter": metadata_filter, "k": 6} # 6 chunks
+    )
+    
+    # 2. Plantilla del Prompt
+    template_str = """
+    Eres un asistente de recuperación de información experto.
+    Usa SÓLO el siguiente contexto para responder a la pregunta.
+    Si la respuesta no se encuentra en el contexto proporcionado, responde honestamente que no tienes la información disponible.
+
+    Contexto: {context}
+    Pregunta: {question}
+
+    Respuesta con fuentes:
+    """
+    prompt_template = PromptTemplate.from_template(template_str)
+    
+    # 3. Inicialización del LLM (usando OllamaLLM)
+    llm = OllamaLLM(model=llm_model_name, temperature=0.0) 
+
+    # 4. La Cadena RAG (Retrieval-Augmented Generation)
+    # Se utiliza la sintaxis de diccionario simple para la entrada, que es la más compatible.
+    rag_chain = (
+        # Paso 1: Mapeo de Entradas (diccionario simple)
+        {
+            "context": retriever | format_docs, 
+            "question": RunnablePassthrough() # Pasa la pregunta directamente
+        }
+        # Paso 2: Formatear el Prompt (de un dict a un PromptValue)
+        | prompt_template
+        # Paso 3: Convertir el PromptValue a string (str) usando RunnableLambda (CRÍTICO para OllamaLLM)
+        # Esto soluciona los errores de 'dict' object has no attribute 'replace' y de TypeError.
+        | RunnableLambda(lambda prompt_value: prompt_value.text)
+        # Paso 4: Pasar la cadena de texto simple al LLM (OllamaLLM)
+        | llm
+        | StrOutputParser()
+    )
+    
+    return rag_chain, retriever
+
+# --- FUNCIONES DE SOPORTE DE STREAMLIT ---
 
 @st.cache_resource
-def load_tts_html_template(file_path: str) -> str:
-    """Carga el contenido del archivo HTML de la plantilla TTS."""
+def load_tts_component_template():
+    """Carga y retorna el contenido del archivo HTML del componente TTS."""
     try:
-        if not os.path.exists(file_path):
-            # Asegúrate de que el archivo tts_component.html esté presente
-            return "Error: Plantilla TTS no encontrada." 
-            
-        with open(file_path, 'r', encoding='utf-8') as f:
+        with open(TTS_TEMPLATE_FILE, 'r', encoding='utf-8') as f:
             return f.read()
-    except Exception as e:
-        return f"Error al cargar la plantilla HTML del TTS: {e}"
+    except FileNotFoundError:
+        st.error(f"Error: No se encontró el archivo '{TTS_TEMPLATE_FILE}'. Asegúrate de que existe.")
+        return None
 
-
-def generate_tts_button(text_to_speak: str, key: str):
+def generate_tts_button(text_to_speak: str):
     """
-    Inyecta un botón y la lógica JS para llamar a la API TTS y reproducir la respuesta.
-    Aplica limpieza adicional para caracteres de control JSON problemáticos.
+    Genera el componente TTS de Streamlit.
+    Se eliminó el argumento 'key' para compatibilidad con versiones antiguas de Streamlit.
     """
-    if not API_KEY_GLOBAL:
+    tts_html_template = load_tts_component_template()
+    if not tts_html_template:
         return
+
+    # Configuración de voz para el componente HTML
+    tts_config = {
+        "text": text_to_speak,
+        "model": TTS_MODEL_NAME,
+        "voice": TTS_VOICE_NAME,
+        "api_key": API_KEY_GLOBAL 
+    }
     
-    # --- CORRECCIÓN CLAVE: LIMPIEZA DE CARACTERES ---
-    # 1. Reemplazar saltos de línea con un espacio para evitar problemas de JSON string literal
-    # La API TTS no necesita el formato Markdown, solo el texto.
-    cleaned_text = text_to_speak.replace('\n', ' ').replace('\r', ' ')
-    # 2. Reemplazar múltiples espacios con uno solo
-    cleaned_text = ' '.join(cleaned_text.split())
-    # 3. Serializar el texto limpio en un JSON string.
-    safe_text = json.dumps(cleaned_text)
+    # Reemplaza el placeholder de la configuración en el HTML
+    final_html = tts_html_template.replace('data-tts-config=\'{}\'', f"data-tts-config='{json.dumps(tts_config)}'")
     
-    html_code = load_tts_html_template(TTS_TEMPLATE_FILE) # Usar la constante aquí
-    
-    if html_code.startswith("Error:"):
-        st.error(html_code)
-        return
-        
-    html_code = html_code.replace('__TTS_MODEL_NAME__', TTS_MODEL_NAME)
-    html_code = html_code.replace('__TTS_VOICE_NAME__', TTS_VOICE_NAME)
-    # INYECCIÓN DE LA API KEY EN EL HTML
-    html_code = html_code.replace('const API_KEY_GLOBAL = "";', f'const API_KEY_GLOBAL = "{API_KEY_GLOBAL}";')
-    html_code = html_code.replace('__SAFE_TEXT__', safe_text)
-    html_code = html_code.replace('__KEY__', key) 
-    
-    if html_code:
-        # Usamos key para que Streamlit sepa que es un componente diferente
-        st.components.v1.html(html_code, height=60, scrolling=False)
-
-# --- FUNCIÓN DE CARGA DE LA BASE DE DATOS Y RAG ---
-
-# Importante: el hash_func previene problemas al cargar Chroma
-# Se usan los selectores como parte de la clave de caché
-@st.cache_resource(hash_funcs={Chroma: lambda _: None, HuggingFaceEmbeddings: lambda _: None})
-def load_and_initialize_rag(selected_strategy: str, selected_theme: str):
-    """Carga la base de datos vectorial específica y crea las cadenas RAG y Summary."""
-    
-    llm_status = "Intentando conectar LLM..."
-    db_path = get_db_path_for_strategy(selected_strategy)
-    
-    # 1. Verificar si la base de datos existe
-    if not os.path.exists(db_path) or not os.listdir(db_path):
-        return None, None, f"❌ DB no encontrada en **{os.path.basename(db_path)}**", llm_status
-
-    try:
-        # 2. Inicializar Embeddings (HuggingFace)
-        embeddings = initialize_embeddings()
-        
-        # 3. Cargar la base de datos vectorial
-        db = Chroma(
-            persist_directory=db_path, 
-            embedding_function=embeddings
-        )
-        db_status = f"✅ Listo ({selected_strategy})"
-        
-        # 4. Crear la cadena RAG (usando búsqueda simple para estabilidad)
-        # El tema se pasa para que el filtro sea aplicado por la cadena
-        rag_chain_instance = create_rag_chain(db, LLM_MODEL_NAME, selected_theme)
-        
-        # 5. Crear la cadena de Resumen 
-        summary_chain_instance = create_summary_chain(LLM_MODEL_NAME)
-        
-        # 6. Verificar si OllamaLLM pudo ser inicializado (si devolvió None)
-        if rag_chain_instance is None or summary_chain_instance is None:
-            llm_status = "❌ Falló. Verifique el servicio Ollama y el modelo 'mistral'."
-            return None, None, db_status, llm_status
-
-        llm_status = "✅ OllamaLLM Inicializado"
-        # Devolvemos ambas cadenas
-        return rag_chain_instance, summary_chain_instance, db_status, llm_status
-    
-    except Exception as e:
-        db_status = f"❌ Error de Chroma/Embeddings: {e}"
-        # Devolvemos None en caso de fallo de DB
-        return None, None, db_status, llm_status
-
-# --- MANEJO DE LA CONSULTA ---
-
-def handle_user_input(prompt, mode):
-    """Maneja la lógica de la consulta y actualiza el historial de chat."""
-    
-    # Se agrega el mensaje del usuario al historial
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    # Verificación de que las cadenas están disponibles
-    if st.session_state.rag_chain is None or st.session_state.summary_chain is None:
-        st.error("El sistema RAG no está inicializado. Verifica los errores en la barra lateral.")
-        st.session_state.messages.append({"role": "assistant", "content": "Error: El sistema RAG no está listo."})
-        return
-        
-    with st.chat_message("assistant"):
-        answer = ""
-        sources = "N/A"
-        
-        if mode == "RAG (Búsqueda Documental)":
-            
-            with st.spinner(f"Consultando DB ({st.session_state.selected_strategy}) y generando respuesta..."):
-                try:
-                    rag_result = st.session_state.rag_chain.invoke(prompt)
-                    answer = rag_result["answer"]
-                    sources = rag_result["sources"].strip() 
-                        
-                except Exception as e:
-                    answer = f"Error al ejecutar la cadena RAG: {e}. Revisa la consola para más detalles."
-                    sources = "N/A"
-                
-                # Renderizar la respuesta del LLM
-                st.markdown(answer)
-                
-                # Renderizar las fuentes
-                if sources and sources != "N/A" and sources.strip():
-                    st.info(f"**Fuentes encontradas (Estrategia: {st.session_state.selected_strategy} | Tema: {st.session_state.selected_theme}):**\n{sources}")
-            
-        elif mode == "Resumen (Summary)":
-            with st.spinner(f"Generando resumen (Summary/{LLM_MODEL_NAME})..."):
-                try:
-                    answer = st.session_state.summary_chain.invoke(prompt)
-                except Exception as e:
-                    answer = f"Error al ejecutar la cadena de resumen: {e}. Revisa la consola para más detalles."
-                
-                sources = "N/A (Modo Resumen)"
-                
-                st.markdown("**Resumen generado:**")
-                st.markdown(answer)
-        
-        # Botón TTS (se muestra después de la respuesta)
-        generate_tts_button(answer, f"tts_{len(st.session_state.messages)}")
-
-    # Guardar el mensaje del asistente al final
-    st.session_state.messages.append({
-        "role": "assistant", 
-        "content": answer, 
-        "sources": sources,
-        "tts_text": answer,
-        "mode": mode, # Guardamos el modo para la correcta visualización
-        "strategy": st.session_state.selected_strategy, # Guardamos la estrategia usada
-        "theme": st.session_state.selected_theme
-    })
-
-
-# --- INTERFAZ DE USUARIO ---
-
-def main_app():
-    """Define la estructura de la aplicación Streamlit."""
-    st.set_page_config(
-        page_title="RAG Experiment: Chunking Types & Ollama/Mistral", 
-        layout="wide", 
-        initial_sidebar_state="expanded"
+    # Renderiza el componente e inicializa JS
+    st.components.v1.html(
+        f"""
+        {final_html}
+        <script>
+            // This script ensures the component is initialized after rendering
+            document.addEventListener('DOMContentLoaded', function() {{
+                const container = document.querySelector('.tts-container');
+                if (container && window.initTtsComponent) {{
+                    window.initTtsComponent(container);
+                }}
+            }});
+            // Fallback for Streamlit re-renders
+            if (window.initTtsComponent) {{
+                 const container = document.querySelector('.tts-container');
+                 if (container) {{
+                    window.initTtsComponent(container);
+                 }}
+            }}
+        </script>
+        """,
+        height=60,
+        scrolling=False
+        # Se eliminó 'key=key' para compatibilidad
     )
 
-    # Inicialización de estados de sesión CRUCIALES
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
+def _get_processed_themes() -> Set[str]:
+    """Lee el log para determinar qué temas (carpetas) se han procesado."""
+    all_themes = set()
+    try:
+        with open(PROCESSED_LOG, 'r', encoding='utf-8') as f:
+            for line in f: 
+                line = line.strip()
+                if line and line.startswith(DATA_PATH.replace("./", "")): # ej: libros/Tema/documento.pdf
+                    parts = line.split('/')
+                    if len(parts) > 1:
+                        all_themes.add(parts[1])
+    except FileNotFoundError:
+        pass
     
-    available_themes = sorted(list(_get_processed_themes()))
-    if 'selected_theme' not in st.session_state:
-        st.session_state.selected_theme = available_themes[0] if available_themes else 'TODOS'
-    
-    strategy_keys = list(CHUNK_STRATEGIES.keys())
-    if 'selected_strategy' not in st.session_state:
-        st.session_state.selected_strategy = strategy_keys[0] if strategy_keys else 'Recursive (Recomendada)'
+    if not all_themes:
+        if not os.path.isdir(DATA_PATH):
+            all_themes.add("NO_DATA")
+    return all_themes
 
-    if 'selected_mode' not in st.session_state:
-        st.session_state.selected_mode = "RAG (Búsqueda Documental)"
-
-    # --- BARRA LATERAL (DEBUG Y CONFIGURACIÓN) ---
-    
-    # Estados temporales para detectar cambios y forzar recarga
-    current_strategy = st.session_state['selected_strategy']
-    current_theme = st.session_state['selected_theme']
-    
-    with st.sidebar:
-        st.title("Configuración y Estado RAG")
-        
-        # 1. ESTRATEGIA CHUNKING SELECTOR
-        strategy_options = list(CHUNK_STRATEGIES.keys())
-        default_index_strategy = strategy_options.index(current_strategy) if current_strategy in strategy_options else 0
-        
-        selected_strategy = st.selectbox(
-            "Selecciona la Estrategia de Segmentación:",
-            options=strategy_options,
-            index=default_index_strategy,
-            key='strategy_selector_input',
-            help="Compara cómo la división de texto (Fija, Recursiva, Estructural) afecta el resultado."
-        )
-        # Si la estrategia cambia, actualizamos el estado, limpiamos y recargamos
-        if current_strategy != selected_strategy:
-            st.session_state['selected_strategy'] = selected_strategy
-            st.session_state.messages = [] # Limpiar historial al cambiar de DB
-            st.cache_resource.clear() 
-            st.rerun() 
-
-        db_path_info = os.path.basename(get_db_path_for_strategy(selected_strategy))
-        st.markdown(f"**Ruta de DB:** `{db_path_info}/`")
-        st.markdown(f"**Tipo:** `{CHUNK_STRATEGIES.get(selected_strategy, {'desc': 'N/A'})['desc']}`")
-        
-        st.markdown("---")
-        
-        # 2. TEMA SELECTOR
-        available_themes = sorted(list(_get_processed_themes()))
-        theme_options = available_themes
-
+@st.cache_resource
+def load_chroma_db(db_path: str, embeddings: HuggingFaceEmbeddings) -> Optional[Chroma]:
+    """Carga la base de datos Chroma de forma cacheada y segura."""
+    if os.path.isdir(db_path):
         try:
-             default_theme_index = theme_options.index(current_theme)
-        except ValueError:
-             default_theme_index = 0
+            db = Chroma(persist_directory=db_path, embedding_function=embeddings)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Chroma DB loaded from: {db_path}")
+            return db
+        except Exception as e:
+            st.error(f"Error loading Chroma DB in {db_path}: {e}")
+            print(f"Error loading Chroma DB in {db_path}: {e}")
+            return None
+    else:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Directory not found: {db_path}")
+        return None
+
+# --- FUNCIÓN DE LA APLICACIÓN PRINCIPAL ---
+
+def main_app():
+    """Función principal que ejecuta la aplicación Streamlit (Solo RAG)."""
+    
+    st.set_page_config(page_title="RAG Multimodal", layout="wide")
+    st.title("📚 Sistema RAG (Generación y Voz TTS)")
+    
+    # 1. Inicialización de Estado y Embeddings
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if 'selected_db_path' not in st.session_state:
+        st.session_state['selected_db_path'] = CHROMA_DB_PATH_RECURSIVE
+    if 'selected_theme' not in st.session_state:
+        st.session_state['selected_theme'] = 'ALL_DOCS'
+    if 'embeddings' not in st.session_state:
+        try:
+            st.session_state['embeddings'] = initialize_embeddings()
+        except Exception as e:
+            st.error(f"No se pudieron cargar los embeddings: {e}. Revisa tu conexión.")
+            return
+
+    embeddings = st.session_state['embeddings']
+    
+    # Mapeo para los selectbox
+    db_options = {
+        "Recursive (1500/300)": CHROMA_DB_PATH_RECURSIVE,
+        "Fixed (1000/200)": CHROMA_DB_PATH_FIXED,
+        "Structured (1000/200)": CHROMA_DB_PATH_STRUCTURED,
+    }
+
+    # --- Sidebar y Controles ---
+    with st.sidebar:
+        st.header("Configuración de RAG")
+
+        st.markdown("---")
+
+        # Seleccionar Estrategia DB (Chunking)
+        selected_db_name = st.selectbox(
+            "Selecciona Estrategia de Indexación (Chunking):",
+            list(db_options.keys()),
+            index=list(db_options.values()).index(st.session_state['selected_db_path']) 
+                  if st.session_state['selected_db_path'] in db_options.values() else 0,
+            key='db_selector',
+        )
+        st.session_state['selected_db_path'] = db_options[selected_db_name]
+        
+        # Seleccionar Tema
+        theme_options_raw = list(_get_processed_themes())
+        if "NO_DATA" in theme_options_raw:
+             st.error("No se encontraron datos en `./libros/`. Ejecuta `python index_data.py`.")
+             return 
+             
+        theme_options = ["ALL_DOCS"] + [t for t in theme_options_raw if t != "ALL_DOCS"]
 
         selected_theme = st.selectbox(
-            "Filtrar documentos por tema:",
-            options=theme_options,
-            index=default_theme_index,
-            key='theme_selector_input',
-            help=f"Los temas disponibles se detectan en la estructura de carpetas de `{DATA_PATH}`."
+            "Filtro por Tema (Carpeta):",
+            theme_options,
+            index=theme_options.index(st.session_state['selected_theme']) if st.session_state['selected_theme'] in theme_options else 0,
+            key='theme_selector',
         )
-        # Si el tema cambia, actualizamos el estado, limpiamos y recargamos
-        if current_theme != selected_theme:
-            st.session_state['selected_theme'] = selected_theme
-            st.session_state.messages = [] # Limpiar historial al cambiar de filtro
-            st.cache_resource.clear() 
-            st.rerun() 
+        st.session_state['selected_theme'] = selected_theme
+        st.sidebar.markdown(f"**Tema Seleccionado:** `{selected_theme}`")
+    
+        st.sidebar.markdown("---")
+        st.sidebar.markdown(f"**Modelo LLM:** `{LLM_MODEL_NAME}` (Vía Ollama)")
+        st.sidebar.markdown(f"**Modelo TTS:** `{TTS_MODEL_NAME}` (Voz: `{TTS_VOICE_NAME}`)")
+
+
+    # --- Carga de Chroma DB y Cadena RAG ---
+
+    current_chain = None
+    retriever = None
+    is_ready = True 
+
+    db = load_chroma_db(st.session_state['selected_db_path'], embeddings)
+    if db is None:
+        st.error(f"La base de datos RAG `{selected_db_name}` no se pudo cargar. Asegúrate de que los archivos se hayan indexado correctamente.")
+        is_ready = False
+    else:
+        metadata_filter = {}
+        if st.session_state['selected_theme'] != 'ALL_DOCS':
+            metadata_filter = {"theme": st.session_state['selected_theme']}
         
-        st.markdown("---")
-        
-        # 3. MODO SELECTOR
-        selected_mode = st.selectbox(
-            "Seleccionar modo de operación:",
-            options=["RAG (Búsqueda Documental)", "Resumen (Summary)"],
-            key="mode_selector_input",
-            index=0 if st.session_state.selected_mode == "RAG (Búsqueda Documental)" else 1,
-            help="El modo RAG busca en tus documentos. El modo Resumen usa el texto de la caja de entrada para resumir."
+        current_chain, retriever = create_rag_chain(
+            llm_model_name=LLM_MODEL_NAME, 
+            db=db,
+            metadata_filter=metadata_filter
         )
-        st.session_state.selected_mode = selected_mode
+    
+    st.session_state['current_chain'] = current_chain
+    st.session_state['current_retriever'] = retriever
 
-        # Initialization of RAG and DB (Depende de la estrategia y el tema seleccionados)
-        # Lo que asegura que la caché se invalida si cambian (aunque reran() ya lo hace)
-        rag_chain, summary_chain, db_status, llm_status = load_and_initialize_rag(selected_strategy, selected_theme)
-        
-        # Actualizar estados de la sesión
-        st.session_state.rag_chain = rag_chain
-        st.session_state.summary_chain = summary_chain
-        st.session_state.db_status = db_status
-        st.session_state.llm_status = llm_status
-        
-        st.markdown("---")
-        st.markdown("### 🛠️ Diagnóstico del Sistema")
-        
-        key_status = '✅ Cargada' if API_KEY_GLOBAL else '❌ No Cargada/Vacía'
-        st.markdown(f"**Clave API (TTS) Estado:** `{key_status}`")
-        
-        st.markdown(f"**Estado de la Base de Datos (Chroma):** `{st.session_state.db_status}`")
-        st.markdown(f"**Estado de conexión LLM (OllamaLLM):** `{st.session_state.llm_status}`")
-        st.markdown("---")
-        st.markdown(f"**Modelo LLM:** `{LLM_MODEL_NAME}`")
-        st.markdown(f"**Modelo Embeddings:** `{EMBED_MODEL_NAME}`")
-        st.markdown(f"**Modelo TTS:** `{TTS_MODEL_NAME}` (Voz: `{TTS_VOICE_NAME}`)")
-        
-        st.subheader("Instrucciones Clave")
-        st.markdown("""
-        1. **Indexación:** Ejecuta `python index_data.py` para crear las DBs faltantes.
-        2. **Ollama:** Asegúrate de que el modelo `mistral` esté disponible y el servicio esté corriendo.
-        """)
-        
-        if st.button("Limpiar Historial de Chat"):
-            st.session_state.messages = []
-            st.cache_resource.clear()
-            st.rerun()
+    if not is_ready:
+        return 
 
-    # --- INTERFAZ PRINCIPAL DE CHAT ---
-
-    st.title("Laboratorio RAG: Comparación de Tipos de Segmentación")
-    st.markdown(f"**DB Activa:** `{selected_strategy}` ({db_path_info}) | **Filtro de Tema:** `{selected_theme}` | **Modo:** `{selected_mode}`")
-
-    # Determinar si la app está lista
-    is_indexed = rag_chain is not None and summary_chain is not None
-
-    if not is_indexed:
-        # Mostrar el error que viene de la función de carga
-        st.error(f"El sistema RAG no está inicializado. Por favor, verifica la barra lateral. Motivo: {db_status} o {llm_status}")
-        return
+    # --- INTERFAZ PRINCIPAL DE CHAT Y TTS ---
 
     # 1. Mostrar Historial de Mensajes y Botones TTS
     for idx, message in enumerate(st.session_state.messages):
@@ -360,26 +278,61 @@ def main_app():
             st.markdown(message["content"])
             
             if message["role"] == "assistant" and "tts_text" in message:
-                generate_tts_button(message["tts_text"], f"history_tts_{idx}")
-            
-            # Mostrar fuentes solo si:
-            # a) El mensaje fue generado en modo RAG.
-            # b) Las fuentes existen y no son "N/A" o vacías.
-            if (message["role"] == "assistant" and 
-                message.get("mode") == "RAG (Búsqueda Documental)" and 
-                message.get("sources", "N/A").strip() not in ["N/A", ""]):
-                 
-                 # Usamos la estrategia y tema guardados en el mensaje, no los actuales de la sesión
-                 msg_strategy = message.get("strategy", "N/A")
-                 msg_theme = message.get("theme", "N/A")
-                 
-                 st.info(f"**Fuentes encontradas (Estrategia usada: {msg_strategy} | Tema: {msg_theme}):**\n{message['sources']}")
+                # El botón TTS se genera aquí para mensajes anteriores
+                # Ya no se usa 'key' aquí
+                generate_tts_button(message["tts_text"])
 
-    # 2. Text input for new query
-    if is_indexed:
-        prompt = st.chat_input("Escribe tu pregunta o el texto a resumir aquí...")
-        if prompt:
-            handle_user_input(prompt, st.session_state.selected_mode)
+    # 2. Manejo de la Entrada del Usuario
+    if prompt := st.chat_input("Escribe tu pregunta para los documentos indexados..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # 3. Llamar a la cadena (LLM)
+        with st.chat_message("assistant"):
+            with st.spinner(f"Generando respuesta RAG con estrategia `{selected_db_name}`..."):
+                response_container = st.empty()
+                
+                try:
+                    if st.session_state['current_chain'] is None:
+                         raise Exception("La cadena RAG no está inicializada.")
+
+                    # Invocar la cadena LLM para obtener la respuesta base
+                    # Se pasa el prompt como input único. La cadena se encarga del resto.
+                    assistant_response_base = st.session_state['current_chain'].invoke(prompt)
+                    
+                    # Obtener las fuentes del retriever
+                    # Se invoca al retriever por separado para obtener las fuentes que se usaron.
+                    retrieved_docs = st.session_state['current_retriever'].invoke(prompt)
+                    
+                    formatted_sources = "\n".join([
+                        f"- {doc.metadata.get('source', 'Fuente desconocida')} (Página {doc.metadata.get('page', 'N/A')}, Tema: {doc.metadata.get('theme', 'N/A')})"
+                        for doc in retrieved_docs
+                    ])
+                    
+                    # TTS necesita solo la respuesta del LLM
+                    tts_text = assistant_response_base 
+                    full_response_text = f"{assistant_response_base}\n\n**Fuentes:**\n{formatted_sources}"
+
+                    # Mostrar la respuesta completa
+                    response_container.markdown(full_response_text)
+                    
+                    # Agregar al historial con el texto para TTS
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": full_response_text,
+                        "tts_text": tts_text 
+                    })
+                    
+                    # Generar el botón TTS inmediatamente después de la respuesta
+                    # Ya no se usa 'key' aquí
+                    generate_tts_button(tts_text)
+                    
+                except Exception as e:
+                    error_msg = f"Error al generar la respuesta RAG. Revisa el log de la terminal. Error: {e}"
+                    response_container.error(error_msg)
+
 
 if __name__ == "__main__":
     main_app()
