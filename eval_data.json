@@ -1,0 +1,26 @@
+[
+  {
+    "question": "¿Cuál es el uso más común que se le da a la técnica Pose Estimation?",
+    "answer_reference": "La estimación de la pose es una tarea fundamental en la visión por computadora y la inteligencia artificial (IA) que implica detectar y rastrear la posición y orientación de las partes del cuerpo humano en imágenes o videos."
+  },
+  {
+    "question": "¿En que casos es útil la programación dinámica?",
+    "answer_reference": "La programación dinámica es una potente herramienta para la resolución de problemas que ayuda a descomponer problemas grandes y complejos en subproblemas más pequeños para encontrar la solución óptima de forma más fácil y eficiente. Además, minimiza los cálculos redundantes."
+  },
+  {
+    "question": "¿Puedes explicar que es el background replacement y cuál técnica se usa para esta tarea?",
+    "answer_reference": "El reemplazo de fondo (background replacement) es una técnica de visión por computadora que implica aislar un sujeto (primer plano) del resto de una imagen o video y sustituir el fondo original por uno nuevo. El objetivo es lograr una integración fluida del sujeto en un contexto diferente sin la necesidad de equipos físicos como pantallas verdes."
+  },
+  {
+    "question": "¿Que es la reconstrucción de superficies?",
+    "answer_reference": "La reconstrucción de superficies en visión por computadora es el proceso de crear un modelo digital tridimensional (3D) de la forma y apariencia de objetos o escenas del mundo real. Transforma datos capturados en 2D (como imágenes, secuencias de video o escaneos láser) en una representación geométrica 3D, añadiendo percepción de profundidad y conciencia espacial a los sistemas artificiales."
+  },
+  {
+    "question": "¿Puedes explicar el concepto de SLAM?",
+    "answer_reference": "El SLAM (Simultaneous Localization and Mapping, o Localización y Mapeo Simultáneos) es un concepto fundamental en robótica y visión por computadora que permite a un agente autónomo (como un robot, un dron o un vehículo) construir un mapa de un entorno desconocido mientras, simultáneamente, se localiza dentro de ese mapa recién construido."
+  },
+  {
+    "question": "¿Sirve la contabilidad general en el ámbito de Computer Vision?",
+    "answer_reference": "La contabilidad general (general accounting) como disciplina (el registro de transacciones financieras, balances y estados de resultados) no tiene una aplicación directa ni un propósito funcional dentro del ámbito técnico de la visión por computadora (computer vision). Son campos de estudio y aplicación completamente distintos."
+  }
+]
