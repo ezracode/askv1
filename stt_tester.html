@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Probador de Reconocimiento de Voz</title>
+    <!-- Carga de Tailwind CSS para un diseño moderno y responsive -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <style>
+        /* Aplicar la fuente Inter globalmente */
+        body { font-family: 'Inter', sans-serif; }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen flex items-center justify-center p-4">
+
+    <div id="app-container" class="bg-white p-8 rounded-xl shadow-2xl w-full max-w-lg">
+        <h1 class="text-3xl font-bold text-center text-red-600 mb-6">Prueba de Voz a Texto (STT)</h1>
+        <p class="text-center text-gray-600 mb-8">
+            Este script utiliza la API nativa de tu navegador (Chrome o Edge recomendado) para transcribir tu voz a texto.
+        </p>
+
+        <!-- Botón de Micrófono -->
+        <div class="flex justify-center mb-6">
+            <button id="micButton" 
+                    class="mic-button w-20 h-20 rounded-full flex items-center justify-center 
+                           bg-gray-200 text-gray-700 text-2xl shadow-lg transition duration-200 
+                           hover:bg-gray-300 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">
+                <i class="fas fa-microphone"></i>
+            </button>
+        </div>
+
+        <!-- Mensaje de Estado -->
+        <div id="statusMessage" class="h-6 text-center text-sm font-medium text-gray-500 mb-4">
+            Pulsa el micrófono para empezar a hablar.
+        </div>
+
+        <!-- Área de Resultados -->
+        <div class="bg-indigo-50 p-4 rounded-lg border-2 border-indigo-200">
+            <h2 class="text-lg font-semibold text-indigo-800 mb-2">Texto Transcrito:</h2>
+            <p id="transcript" class="text-gray-800 min-h-12"></p>
+        </div>
+        
+        <!-- Indicador de Navegador Incompatible -->
+        <p id="compatibility-warning" class="text-sm text-center text-red-500 mt-4 hidden">
+            <i class="fas fa-exclamation-triangle mr-1"></i> Tu navegador no soporta la API de Reconocimiento de Voz nativa.
+        </p>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const micButton = document.getElementById('micButton');
+            const statusMessage = document.getElementById('statusMessage');
+            const transcript = document.getElementById('transcript');
+            const compatibilityWarning = document.getElementById('compatibility-warning');
+            
+            // Verifica si la API está disponible (usa prefijos para compatibilidad)
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            
+            if (!SpeechRecognition) {
+                compatibilityWarning.classList.remove('hidden');
+                micButton.disabled = true;
+                statusMessage.textContent = 'API no encontrada. Solo funciona con Chrome o Edge.';
+                return;
+            }
+
+            const recognition = new SpeechRecognition();
+            recognition.continuous = false; // Detener después de la pausa
+            recognition.lang = 'es-ES'; // Configurar el idioma
+            recognition.interimResults = true; // Mostrar resultados parciales
+
+            let isRecording = false;
+
+            // --- Manejo de Eventos ---
+
+            recognition.onstart = () => {
+                isRecording = true;
+                micButton.classList.add('bg-red-500', 'text-white', 'animate-pulse');
+                statusMessage.textContent = '🎙️ Escuchando...';
+                transcript.textContent = '';
+            };
+
+            recognition.onresult = (event) => {
+                let interimTranscript = '';
+                let finalTranscript = '';
+                
+                for (let i = event.resultIndex; i < event.results.length; ++i) {
+                    if (event.results[i].isFinal) {
+                        finalTranscript += event.results[i][0].transcript;
+                    } else {
+                        interimTranscript += event.results[i][0].transcript;
+                    }
+                }
+                
+                // Muestra la transcripción en tiempo real o el resultado final
+                transcript.textContent = finalTranscript || interimTranscript;
+            };
+
+            recognition.onend = () => {
+                isRecording = false;
+                micButton.classList.remove('bg-red-500', 'text-white', 'animate-pulse');
+                micButton.classList.add('bg-gray-200', 'text-gray-700');
+                statusMessage.textContent = '✅ Transcripción finalizada. Pulsa para repetir.';
+                
+                if (transcript.textContent === '') {
+                    statusMessage.textContent = '⚠️ No se detectó voz. Inténtalo de nuevo.';
+                }
+            };
+            
+            recognition.onerror = (event) => {
+                isRecording = false;
+                micButton.classList.remove('bg-red-500', 'text-white', 'animate-pulse');
+                micButton.classList.add('bg-gray-200', 'text-gray-700');
+                
+                let errorMsg = 'Error de reconocimiento: ';
+                if (event.error === 'not-allowed') {
+                    errorMsg += 'Acceso al micrófono denegado.';
+                } else if (event.error === 'no-speech') {
+                    errorMsg += 'No se detectó voz.';
+                } else {
+                    errorMsg += event.error;
+                }
+                statusMessage.textContent = errorMsg;
+                console.error('STT Error:', event.error);
+            };
+
+            // --- Controlador del Botón ---
+            micButton.addEventListener('click', () => {
+                if (isRecording) {
+                    recognition.stop();
+                } else {
+                    try {
+                        recognition.start();
+                    } catch (e) {
+                        // Captura el error si recognition.start() es llamado mientras ya está activo
+                        console.warn("Recognition already started or error in start:", e);
+                        recognition.stop();
+                    }
+                }
+            });
+        });
+    </script>
+</body>
+</html>
